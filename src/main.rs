@@ -1,10 +1,18 @@
+use std::ptr::null;
+use std::marker::PhantomPinned;
+
 /// ВАЖНО: все задания выполнять не обязательно. Что получится то получится сделать.
 
 /// Задание 1
 /// Почему фунция example1 зависает?
+/// ответ: первая feature вызывает try_recv, не отдавая управление tokio. А так как runtime запущен в одном потоке,
+/// то вторая feature не выполняется.
+/// решение1: увеличить колличество потоков что бы было место под вторую feature,
+/// решение2: либо использовать try_recv в цикле с yield_now,
+/// решение3 (кажется наиболее правильное): либо использовать recv вместо try_recv
 fn example1() {
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(1) // можно .worker_threads(2)
         .build()
         .unwrap();
     let (sd, mut rc) = tokio::sync::mpsc::unbounded_channel();
@@ -12,8 +20,9 @@ fn example1() {
     println!("execution started");
     let a1 = async move {
         loop {
-            if let Ok(p) = rc.try_recv() {
+            if let Some(p) = rc.recv().await {
                 println!("{}", p);
+                
                 break;
             }
         }
@@ -35,8 +44,31 @@ struct Example2Struct {
     ptr: *const u64,
 }
 
+// неправильный вариант реализации Clone, NRVO не всегда срабатывает
+// impl Clone for Example2Struct {
+//     fn clone(&self) -> Self {
+//         let mut ans = Example2Struct {
+//             value: self.value,
+//             ptr: null(),
+//         };
+//         ans.ptr = &ans.value as *const u64;
+//         ans
+
+//     }
+// }
+
 /// Задание 2
 /// Какое число тут будет распечатано 32 64 или 128 и почему?
+/// выведет 64, так как t2.ptr указывает на t1.value, а t1.value не изменялся после клонирования
+/// 
+/// 
+/// решение 1 (не верное): сначала подумал что достаточно просто правильно реализовать Clone, 
+/// но не помогло, в дебаге не работает NRVO
+/// 
+/// решение 2 (костыльное): просто каждый раз руками присваивать ptr на value
+/// 
+/// Правильное решение наверное такое: запинить структуру, но тогда ее интерфейс изменится.
+/// позже попытаюсь реализовать.
 fn example2() {
 
     let num = 32;
@@ -52,7 +84,10 @@ fn example2() {
 
     drop(t1);
 
+    t2.ptr = &t2.value;
+
     t2.value = 128;
+    
 
     unsafe {
         println!("{}", t2.ptr.read());
@@ -63,9 +98,26 @@ fn example2() {
 
 /// Задание 3
 /// Почему время исполнения всех пяти заполнений векторов разное (под linux)?
+/// 
+/// 
+/// ответ: поправил четвертый вариант, так как он не менял значения вектора, а просто менял локальную переменную.
+/// cargo run --release
+// execution time 15383291
+// execution time 11304167
+// execution time 5430208
+// execution time 42
+// execution time 42
+// cargo run --debug
+// execution time 132575666
+// execution time 103532208
+// execution time 32253416
+// execution time 26145833
+// execution time 6917
 fn example3() {
     let capacity = 10000000u64;
 
+
+    // тут хуже всего. реаллокация + ручное заполнение каждого элемента.
     let start_time = std::time::Instant::now();
     let mut my_vec1 = Vec::new();
     for i in 0u64..capacity {
@@ -76,6 +128,7 @@ fn example3() {
         (std::time::Instant::now() - start_time).as_nanos()
     );
 
+    // уже лучше. убоали реаллокацию.
     let start_time = std::time::Instant::now();
     let mut my_vec2 = Vec::with_capacity(capacity as usize);
     for i in 0u64..capacity {
@@ -86,6 +139,8 @@ fn example3() {
         (std::time::Instant::now() - start_time).as_nanos()
     );
 
+    // могу ответить не точно, но скорее всего здесь срабатывает векторизация записи памяти, 
+    // надо смотреть внутрь макроса vec![]. 
     let start_time = std::time::Instant::now();
     let mut my_vec3 = vec![6u64; capacity as usize];
     println!(
@@ -93,15 +148,24 @@ fn example3() {
         (std::time::Instant::now() - start_time).as_nanos()
     );
 
+    // здесь скорее всего тоже векторизация, так как значение одно и то же
     let start_time = std::time::Instant::now();
-    for mut elem in my_vec3 {
-        elem = 7u64;
+    for elem in &mut my_vec3 {
+        *elem = 7u64;
     }
     println!(
         "execution time {}",
         (std::time::Instant::now() - start_time).as_nanos()
     );
+    // в релизе видимо вообще этот цикл выкидывается, если 
+    // эту строчку раскомментировать, то время станет сравнимым с предыдущим
+    //print!("{}", my_vec3[0]); 
+    
 
+    // здесь макрос vec![] разворачивается просто в выделение памяти.
+    // есть возможность у системного аллокатора попросить именно зануленную память
+    // но при обращении в дальнейшем будет происходить уже реальное выделение физической памяти,
+    // там будет неявный memset 
     let start_time = std::time::Instant::now();
     let my_vec4 = vec![0u64; capacity as usize];
     println!(
@@ -114,23 +178,51 @@ fn example3() {
 
 /// Задание 4
 /// Почему такая разница во времени выполнения example4_async_mutex и example4_std_mutex?
+/// 
+/// ответ: std::mutex быстрее так-как он реализован через futex, который прежде чем сделать вызов через
+/// libc и создать mutex сначала делает несколько итераций spin_lock-а
+/// В tokio mutex такого не происходит, он честно взаимодействует с tokio runtime
+/// 
+/// оригинальный код
+/// execution time 3959287583
+/// execution time 92004500
+/// 
+/// заменил условие остановки
+/// execution time 3290117584
+/// execution time 157927292
+/// 
+/// заменил плохой код в циклах (там значение не менялось, только читалось):
+/// execution time 3282834292
+/// execution time 172313125
+/// 
+/// сделал три потока для рантайма:
+/// execution time 3276831000
+/// execution time 206903875
+/// 
 async fn example4_async_mutex(tokio_protected_value: std::sync::Arc<tokio::sync::Mutex<u64>>) {
     for _ in 0..1000000 {
-        let mut value = *tokio_protected_value.clone().lock().await;
-        value = 4;
+        //wtf?
+        //let mut value = *tokio_protected_value.clone().lock().await;
+        //value = 4;
+        let mut value = tokio_protected_value.lock().await;
+        *value = 4;
     }
 }
 
 async fn example4_std_mutex(protected_value: std::sync::Arc<std::sync::Mutex<u64>>) {
     for _ in 0..1000000 {
-        let mut value = *protected_value.clone().lock().unwrap();
-        value = 4;
+        //wtf?
+        //let mut value = *protected_value.clone().lock().unwrap();
+        //value = 4;
+        let mut value = protected_value.lock().unwrap();
+        *value = 4
     }
 }
 
 fn example4() {
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        //.worker_threads(2) лучше три потока 
+        .worker_threads(3)
         .build()
         .unwrap();
 
@@ -141,7 +233,11 @@ fn example4() {
     let h2 = rt.spawn(example4_async_mutex(tokio_protected_value.clone()));
     let h3 = rt.spawn(example4_async_mutex(tokio_protected_value.clone()));
 
-    while !(h1.is_finished() || h2.is_finished() || h3.is_finished()) {}
+    // странное условие, ждем пока только один завершится? + нагружаем процессор в бесконечном цикле
+    // while !(h1.is_finished() || h2.is_finished() || h3.is_finished()) {}
+    rt.block_on(async {
+        let _ = tokio::join!(h1, h2, h3);
+    });
     println!(
         "execution time {}",
         (std::time::Instant::now() - start_time).as_nanos()
@@ -154,7 +250,10 @@ fn example4() {
     let h2 = rt.spawn(example4_std_mutex(protected_value.clone()));
     let h3 = rt.spawn(example4_std_mutex(protected_value.clone()));
 
-    while !(h1.is_finished() || h2.is_finished() || h3.is_finished()) {}
+    //while !(h1.is_finished() || h2.is_finished() || h3.is_finished()) {}
+    rt.block_on(async {
+        let _ = tokio::join!(h1, h2, h3);
+    });
     println!(
         "execution time {}",
         (std::time::Instant::now() - start_time).as_nanos()
@@ -271,5 +370,6 @@ mod example5_tests {
 }
 
 fn main() {
-    example1();
+    example4();
+
 }
